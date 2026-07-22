@@ -4,6 +4,7 @@ mod install;
 mod license;
 mod service;
 
+use crate::github::LicenseSource;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use std::collections::HashMap;
@@ -31,6 +32,10 @@ struct Cli {
     /// 强制覆盖备份
     #[arg(long, global = true)]
     force: bool,
+
+    /// License 源: eval（默认，starain2000/HalconEvalLicenses）或 community（lovelyyoshino/Halcon_licenses）
+    #[arg(long, global = true, default_value = "eval")]
+    source: LicenseSource,
 }
 
 #[derive(Subcommand, Debug)]
@@ -87,7 +92,7 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         Some(Commands::ListMonths) => {
-            let months = github::list_months().await?;
+            let months = github::list_months(cli.source).await?;
             println!("可用月份（共 {} 个）:", months.len());
             for m in &months {
                 println!("  {m}");
@@ -100,7 +105,7 @@ async fn main() -> Result<()> {
                     schedule.days.as_deref(),
                     schedule.interval,
                 )?;
-                service::install(&exe, nssm_path.as_deref(), &sched)?;
+                service::install(&exe, nssm_path.as_deref(), &sched, cli.source)?;
             }
             ServiceAction::Remove { nssm_path } => {
                 service::remove(nssm_path.as_deref())?;
@@ -127,7 +132,7 @@ async fn main() -> Result<()> {
 /// `quiet` 模式下输出适合服务日志的简洁格式
 pub(crate) async fn run_license_check(cli: &Cli, quiet: bool) -> Result<()> {
     // 1. 获取月份
-    let months = github::list_months().await?;
+    let months = github::list_months(cli.source).await?;
     if months.is_empty() {
         anyhow::bail!("仓库中没有可用的月份数据");
     }
@@ -149,7 +154,7 @@ pub(crate) async fn run_license_check(cli: &Cli, quiet: bool) -> Result<()> {
     if !quiet {
         println!("[*] 获取 {target_month} 的许可证文件列表...");
     }
-    let entries = github::list_files(&target_month).await?;
+    let entries = github::list_files(cli.source, &target_month).await?;
 
     if !quiet {
         let dat_count = entries.iter().filter(|e| e.name.ends_with(".dat")).count();
@@ -234,7 +239,7 @@ pub(crate) async fn run_license_check(cli: &Cli, quiet: bool) -> Result<()> {
             if let Some(cached) = download_cache.get(&entry.name) {
                 datas.push(cached.clone());
             } else {
-                match github::download_file(&target_month, &entry.name).await {
+                match github::download_file(cli.source, &target_month, &entry.name).await {
                     Ok(data) => {
                         download_cache.insert(entry.name.clone(), data.clone());
                         datas.push(data);

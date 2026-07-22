@@ -1,3 +1,4 @@
+use crate::github::LicenseSource;
 use anyhow::{Context, Result};
 use chrono::Datelike;
 use std::path::{Path, PathBuf};
@@ -68,7 +69,7 @@ impl Schedule {
 // ── service install ──────────────────────────────────────────
 
 /// 注册 Windows 服务
-pub fn install(exe_path: &Path, nssm_path: Option<&Path>, schedule: &Schedule) -> Result<()> {
+pub fn install(exe_path: &Path, nssm_path: Option<&Path>, schedule: &Schedule, source: LicenseSource) -> Result<()> {
     let nssm = ensure_nssm(nssm_path)?;
     println!("[*] NSSM: {}", nssm.display());
 
@@ -90,7 +91,7 @@ pub fn install(exe_path: &Path, nssm_path: Option<&Path>, schedule: &Schedule) -
 
     // 安装服务
     nssm_run(&nssm, &["install", SERVICE_NAME, &exe_str])?;
-    nssm_set(&nssm, "AppParameters", &format!("service run {cli_args}"))?;
+    nssm_set(&nssm, "AppParameters", &format!("service run {cli_args} {}", source.as_cli_arg()))?;
     nssm_set(&nssm, "DisplayName", "Halcon License Fetcher")?;
     nssm_set(&nssm, "Description", &format!("自动更新 MVTec 产品许可证 - {desc}"))?;
     nssm_set(&nssm, "Start", "SERVICE_AUTO_START")?;

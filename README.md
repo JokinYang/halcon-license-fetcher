@@ -5,7 +5,12 @@
 
 自动从 GitHub 下载并安装 MVTec 产品（HALCON / HDevelop / DeepLearningTool）许可证的工具。
 
-许可证来源：[lovelyyoshino/Halcon_licenses](https://github.com/lovelyyoshino/Halcon_licenses)
+许可证来源：
+
+- **eval**（默认）：[starain2000/HalconEvalLicenses](https://github.com/starain2000/HalconEvalLicenses) — zip 归档格式
+- **community**：[lovelyyoshino/Halcon_licenses](https://github.com/lovelyyoshino/Halcon_licenses) — 目录格式
+
+通过 `--source` 选项切换源。两个源自动适配不同的文件组织格式。
 
 ## 功能
 
@@ -46,6 +51,7 @@ halcon-license-fetcher [OPTIONS] [COMMAND]
 |------|------|
 | `--halcon-root <PATH>` | 手动指定安装目录 |
 | `--month <YYYY.MM>` | 指定月份（默认：最新） |
+| `--source <SOURCE>` | License 源: `eval`（默认）或 `community` |
 | `--dry-run` | 仅预览，不写入 |
 | `--force` | 强制覆盖备份 |
 
@@ -53,11 +59,13 @@ halcon-license-fetcher [OPTIONS] [COMMAND]
 
 ```
 halcon-license-fetcher service install [OPTIONS]
-  --interval <DAYS>    检查间隔（默认 7 天）
-  --nssm-path <PATH>   手动指定 nssm.exe 路径
+      --days <DAYS>        每月执行日（1-28，逗号分隔，如 1,15）
+      --interval <DAYS>    间隔天数（如 7）
+      --source <SOURCE>    License 源（默认 eval）
+      --nssm-path <PATH>   手动指定 nssm.exe 路径
 
 halcon-license-fetcher service remove
-  --nssm-path <PATH>   手动指定 nssm.exe 路径
+      --nssm-path <PATH>   手动指定 nssm.exe 路径
 ```
 
 ## 产品类型与 License 匹配
