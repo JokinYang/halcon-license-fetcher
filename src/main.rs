@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 
-/// 自动从 GitHub 下载并安装 Halcon 许可证（支持多产品）
+/// 自动从 GitHub 下载并安装 Halcon 许可证（支持多产品、多 license 合并）
 #[derive(Parser, Debug)]
 #[command(name = "halcon-license-fetcher")]
 #[command(version, about, long_about = None)]
@@ -37,7 +37,6 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // 特殊命令：列出可用月份
     if cli.list_months {
         println!("[*] 获取可用月份列表...");
         let months = github::list_months().await?;
@@ -48,7 +47,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Step 1: 获取可用月份，确定目标月份
+    // Step 1: 获取月份
     let months = github::list_months().await?;
     if months.is_empty() {
         anyhow::bail!("仓库中没有可用的月份数据");
@@ -56,7 +55,7 @@ async fn main() -> Result<()> {
 
     let target_month = if let Some(ref m) = cli.month {
         if !months.contains(m) {
-            anyhow::bail!("月份 {m} 不在可用列表中，使用 --list-months 查看所有可用月份");
+            anyhow::bail!("月份 {m} 不在可用列表中，使用 --list-months 查看");
         }
         m.clone()
     } else {
@@ -65,13 +64,13 @@ async fn main() -> Result<()> {
         latest
     };
 
-    // Step 2: 获取该月份的所有 license 文件
+    // Step 2: 获取所有 license 文件
     println!("[*] 获取 {target_month} 的许可证文件列表...");
     let entries = github::list_files(&target_month).await?;
     let dat_count = entries.iter().filter(|e| e.name.ends_with(".dat")).count();
     println!("    找到 {dat_count} 个 .dat 文件\n");
 
-    // Step 3: 检测所有 MVTec 产品（或使用手动指定的路径）
+    // Step 3: 检测产品
     let products: Vec<detect::MvtecProduct> = if let Some(ref root) = cli.halcon_root {
         println!("[*] 使用指定路径: {}", root.display());
         let version = detect::extract_version_from_path(root)
@@ -91,15 +90,21 @@ async fn main() -> Result<()> {
         let products = detect::find_all_products()?;
         println!("    发现 {} 个产品:", products.len());
         for p in &products {
-            println!("      {} {} ({})", p.version, p.kind.label(), p.root.display());
+            println!(
+                "      {} {} ({})",
+                p.version,
+                p.kind.label(),
+                p.root.display()
+            );
         }
         println!();
         products
     };
 
-    // Step 4: 为每个产品下载并安装 license
+    // Step 4: 为每个产品收集、下载、合并安装 license
     let mut success = 0;
-    let mut skipped = 0;
+    let mut download_cache: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
 
     for product in &products {
         println!(
@@ -109,46 +114,55 @@ async fn main() -> Result<()> {
         );
         println!("  路径: {}", product.root.display());
 
-        match license::pick_license_for_product(&entries, product) {
-            Some(entry) => {
-                let desc = license::license_description(&entry.name);
+        let matched = license::pick_licenses_for_product(&entries, product);
 
-                if license::is_exact_match(&entry.name, &product.version) {
-                    println!("  [*] 精确匹配: {}", entry.name);
-                } else {
-                    println!("  [*] 兼容匹配: {} ({})", entry.name, desc);
-                }
+        if matched.is_empty() {
+            println!("  [!] 未找到任何匹配的许可证，跳过\n");
+            continue;
+        }
 
-                // 下载
+        // 显示匹配的文件
+        let descs = license::describe_bundle(&matched);
+        println!("  [*] 将合并 {} 个许可证:", matched.len());
+        for (entry, desc) in matched.iter().zip(descs.iter()) {
+            println!("      {} ({})", entry.name, desc);
+        }
+
+        // 下载所有匹配文件（使用缓存避免重复下载）
+        let mut datas: Vec<Vec<u8>> = Vec::new();
+        let mut all_ok = true;
+        for entry in &matched {
+            if let Some(cached) = download_cache.get(&entry.name) {
+                println!("      ↓ 已缓存: {} ({} 字节)", entry.name, cached.len());
+                datas.push(cached.clone());
+            } else {
                 match github::download_file(&target_month, &entry.name).await {
                     Ok(data) => {
-                        println!("  [*] 已下载 {} 字节", data.len());
-
-                        // 安装
-                        match install::install_license(
-                            &data,
-                            &product.root,
-                            &entry.name,
-                            cli.dry_run,
-                            cli.force,
-                        ) {
-                            Ok(()) => {
-                                println!("  [✓] 已安装\n");
-                                success += 1;
-                            }
-                            Err(e) => {
-                                eprintln!("  [!] 安装失败: {e}\n");
-                            }
-                        }
+                        println!("      ↓ 已下载: {} ({} 字节)", entry.name, data.len());
+                        download_cache.insert(entry.name.clone(), data.clone());
+                        datas.push(data);
                     }
                     Err(e) => {
-                        eprintln!("  [!] 下载失败: {e}\n");
+                        eprintln!("      ✗ 下载失败: {} — {e}", entry.name);
+                        all_ok = false;
                     }
                 }
             }
-            None => {
-                println!("  [!] 未找到匹配的许可证，跳过\n");
-                skipped += 1;
+        }
+
+        if !all_ok || datas.is_empty() {
+            println!("  [!] 下载未完全成功，跳过安装\n");
+            continue;
+        }
+
+        // 合并安装
+        match install::install_license_bundle(&datas, &product.root, cli.dry_run, cli.force) {
+            Ok(()) => {
+                success += 1;
+                println!("  [✓] 完成\n");
+            }
+            Err(e) => {
+                eprintln!("  [!] 安装失败: {e}\n");
             }
         }
     }
@@ -159,12 +173,7 @@ async fn main() -> Result<()> {
         println!("[DRY-RUN] 以上是将要执行的操作（{total} 个产品），实际文件未被修改");
     } else {
         println!(
-            "[✓] 完成! {success}/{total} 个产品已安装许可证{}",
-            if skipped > 0 {
-                format!("（{} 个跳过）", skipped)
-            } else {
-                String::new()
-            }
+            "[✓] 完成! {success}/{total} 个产品已安装许可证",
         );
     }
 
