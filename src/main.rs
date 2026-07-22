@@ -5,7 +5,7 @@ mod license;
 mod service;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -46,13 +46,24 @@ enum Commands {
     },
 }
 
+#[derive(Args, Debug, Clone)]
+#[group(required = false, multiple = false)]
+struct ScheduleArg {
+    /// 每月几号执行（1-28，逗号分隔，如 1,15）
+    #[arg(long)]
+    days: Option<String>,
+
+    /// 间隔天数（如 7）
+    #[arg(long)]
+    interval: Option<u64>,
+}
+
 #[derive(Subcommand, Debug)]
 enum ServiceAction {
-    /// 注册为 Windows 服务（开机自启，每月固定日期执行）
+    /// 注册为 Windows 服务（开机自启，默认每月1日）
     Install {
-        /// 每月几号执行（1-28，逗号分隔，默认 1）
-        #[arg(long, default_value = "1")]
-        days: String,
+        #[command(flatten)]
+        schedule: ScheduleArg,
         /// 手动指定 nssm.exe 路径
         #[arg(long)]
         nssm_path: Option<PathBuf>,
@@ -65,9 +76,8 @@ enum ServiceAction {
     },
     /// 服务入口（由 NSSM 调用，不直接使用）
     Run {
-        /// 每月几号执行（1-28，逗号分隔）
-        #[arg(long, default_value = "1")]
-        days: String,
+        #[command(flatten)]
+        schedule: ScheduleArg,
     },
 }
 
@@ -84,17 +94,23 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Service { action }) => match action {
-            ServiceAction::Install { days, nssm_path } => {
+            ServiceAction::Install { schedule, nssm_path } => {
                 let exe = std::env::current_exe()?;
-                let d = service::parse_days(days)?;
-                service::install(&exe, nssm_path.as_deref(), &d)?;
+                let sched = service::Schedule::from_opts(
+                    schedule.days.as_deref(),
+                    schedule.interval,
+                )?;
+                service::install(&exe, nssm_path.as_deref(), &sched)?;
             }
             ServiceAction::Remove { nssm_path } => {
                 service::remove(nssm_path.as_deref())?;
             }
-            ServiceAction::Run { days } => {
-                let d = service::parse_days(days)?;
-                service::run_loop(d, || run_license_check(&cli, true)).await;
+            ServiceAction::Run { schedule } => {
+                let sched = service::Schedule::from_opts(
+                    schedule.days.as_deref(),
+                    schedule.interval,
+                )?;
+                service::run_loop(sched, || run_license_check(&cli, true)).await;
             }
         },
         None => {

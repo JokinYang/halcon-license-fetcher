@@ -6,10 +6,69 @@ use std::process::Command;
 const SERVICE_NAME: &str = "HalconLicenseFetcher";
 const NSSM_BYTES: &[u8] = include_bytes!("../assets/nssm.exe");
 
+/// 调度模式
+#[derive(Debug, Clone)]
+pub enum Schedule {
+    /// 每月固定日期: [1, 15]
+    Monthly(Vec<u32>),
+    /// 每隔 N 天
+    Interval(u64),
+}
+
+impl Schedule {
+    /// 从 CLI 参数解析（默认每月 1 日）
+    pub fn from_opts(days: Option<&str>, interval: Option<u64>) -> Result<Self> {
+        match (days, interval) {
+            (Some(d), None) => Ok(Schedule::Monthly(parse_days(d)?)),
+            (None, Some(i)) => {
+                if i < 1 {
+                    anyhow::bail!("--interval 必须 >= 1");
+                }
+                Ok(Schedule::Interval(i))
+            }
+            (None, None) => Ok(Schedule::Monthly(vec![1])), // 默认
+            (Some(_), Some(_)) => {
+                anyhow::bail!("--days 和 --interval 不能同时使用")
+            }
+        }
+    }
+
+    /// 转为 NSSM 命令行参数
+    pub fn to_cli_args(&self) -> String {
+        match self {
+            Schedule::Monthly(days) => {
+                let s = days.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
+                format!("--days {s}")
+            }
+            Schedule::Interval(i) => format!("--interval {i}"),
+        }
+    }
+
+    /// 用户可读的描述
+    pub fn description(&self) -> String {
+        match self {
+            Schedule::Monthly(days) => {
+                let mut sorted = days.clone();
+                sorted.sort();
+                let list: Vec<String> = sorted.iter().map(|d| format!("{}日", d)).collect();
+                format!("每月 {}", list.join("、"))
+            }
+            Schedule::Interval(i) => format!("每 {i} 天"),
+        }
+    }
+
+    fn next_run_desc(&self) -> String {
+        match self {
+            Schedule::Monthly(days) => monthly_next_desc(days),
+            Schedule::Interval(i) => format!("{} 天后", i),
+        }
+    }
+}
+
 // ── service install ──────────────────────────────────────────
 
 /// 注册 Windows 服务
-pub fn install(exe_path: &Path, nssm_path: Option<&Path>, days: &[u32]) -> Result<()> {
+pub fn install(exe_path: &Path, nssm_path: Option<&Path>, schedule: &Schedule) -> Result<()> {
     let nssm = ensure_nssm(nssm_path)?;
     println!("[*] NSSM: {}", nssm.display());
 
@@ -26,12 +85,12 @@ pub fn install(exe_path: &Path, nssm_path: Option<&Path>, days: &[u32]) -> Resul
     let exe_str = exe_path.to_string_lossy();
     let exe_dir = exe_path.parent().unwrap_or(Path::new("."));
 
-    let days_str = days.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
-    let desc = days_desc(days);
+    let cli_args = schedule.to_cli_args();
+    let desc = schedule.description();
 
     // 安装服务
     nssm_run(&nssm, &["install", SERVICE_NAME, &exe_str])?;
-    nssm_set(&nssm, "AppParameters", &format!("service run --days {days_str}"))?;
+    nssm_set(&nssm, "AppParameters", &format!("service run {cli_args}"))?;
     nssm_set(&nssm, "DisplayName", "Halcon License Fetcher")?;
     nssm_set(&nssm, "Description", &format!("自动更新 MVTec 产品许可证 - {desc}"))?;
     nssm_set(&nssm, "Start", "SERVICE_AUTO_START")?;
@@ -81,7 +140,7 @@ pub fn remove(nssm_path: Option<&Path>) -> Result<()> {
 }
 
 /// 服务主循环（由 NSSM 调用）
-pub async fn run_loop<F, Fut>(days: Vec<u32>, check_fn: F)
+pub async fn run_loop<F, Fut>(schedule: Schedule, check_fn: F)
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
@@ -93,18 +152,21 @@ where
         match check_fn().await {
             Ok(()) => {
                 let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                let next = next_run_desc(&days);
+                let next = schedule.next_run_desc();
                 eprintln!("[{now}] 检查完成，{next}");
             }
             Err(e) => {
                 let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                let next = next_run_desc(&days);
+                let next = schedule.next_run_desc();
                 eprintln!("[{now}] 检查失败: {e}");
                 eprintln!("[{now}] {next} 重试");
             }
         }
 
-        let secs = seconds_until_next_run(&days);
+        let secs = match &schedule {
+            Schedule::Monthly(days) => seconds_until_next_run(days),
+            Schedule::Interval(days) => (*days as i64) * 86400,
+        };
         tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
     }
 }
@@ -148,7 +210,7 @@ fn seconds_until_next_run(days: &[u32]) -> i64 {
     86400 // fallback: 1 天
 }
 
-fn next_run_desc(days: &[u32]) -> String {
+fn monthly_next_desc(days: &[u32]) -> String {
     let now = chrono::Local::now();
     let today = now.date_naive();
     let mut sorted: Vec<u32> = days.to_vec();
@@ -164,13 +226,6 @@ fn next_run_desc(days: &[u32]) -> String {
 
     let first = sorted.first().copied().unwrap_or(1);
     format!("下次执行: 下月{}日", first)
-}
-
-fn days_desc(days: &[u32]) -> String {
-    let mut sorted: Vec<u32> = days.to_vec();
-    sorted.sort();
-    let list: Vec<String> = sorted.iter().map(|d| format!("{}日", d)).collect();
-    format!("每月 {}", list.join("、"))
 }
 
 /// 解析 --days 参数
