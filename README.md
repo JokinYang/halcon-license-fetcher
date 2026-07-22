@@ -14,12 +14,6 @@
 - **多 License 合并** — 自动合并 Support + Eval + DL 许可证到同一个 `license.dat`
 - **Windows 服务** — 一键注册为系统服务，开机自启，每 7 天自动更新
 
-## 下载
-
-[![Build and Release](https://github.com/JokinYang/halcon-license-fetcher/actions/workflows/release.yml/badge.svg)](https://github.com/JokinYang/halcon-license-fetcher/actions/workflows/release.yml)
-
-[**下载最新版本**](https://github.com/JokinYang/halcon-license-fetcher/releases/download/latest/halcon-license-fetcher.exe)
-
 ## 快速开始
 
 ```powershell
