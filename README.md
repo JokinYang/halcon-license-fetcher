@@ -2,7 +2,7 @@
 
 自动从 GitHub 下载并安装 MVTec 产品（HALCON / HDevelop / DeepLearningTool）许可证的工具。
 
-许可证来源：[lovelyyoshino/Halcon_licenses](https://github.com/lovelyyoshino/Halcon_licenses)（覆盖 2018.02 ~ 2026.07，共 85+ 个月份）。
+许可证来源：[lovelyyoshino/Halcon_licenses](https://github.com/lovelyyoshino/Halcon_licenses)
 
 ## 功能
 
