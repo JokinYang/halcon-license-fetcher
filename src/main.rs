@@ -2,52 +2,117 @@ mod detect;
 mod github;
 mod install;
 mod license;
+mod service;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// 自动从 GitHub 下载并安装 Halcon 许可证（支持多产品、多 license 合并）
 #[derive(Parser, Debug)]
 #[command(name = "halcon-license-fetcher")]
-#[command(version, about, long_about = None)]
+#[command(version, about = "自动下载并安装 MVTec 产品许可证")]
 struct Cli {
-    /// 手动指定 Halcon 安装目录（仅处理该目录，跳过自动扫描）
-    #[arg(long)]
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// 手动指定 MVTec 安装目录（仅处理该目录，跳过自动扫描）
+    #[arg(long, global = true)]
     halcon_root: Option<PathBuf>,
 
-    /// 指定月份（默认：使用最新可用月份，格式 YYYY.MM）
-    #[arg(long)]
+    /// 指定月份（默认：最新，格式 YYYY.MM）
+    #[arg(long, global = true)]
     month: Option<String>,
 
     /// 仅显示操作，不实际写入文件
-    #[arg(long)]
+    #[arg(long, global = true)]
     dry_run: bool,
 
-    /// 强制覆盖，不询问
-    #[arg(long)]
+    /// 强制覆盖备份
+    #[arg(long, global = true)]
     force: bool,
+}
 
+#[derive(Subcommand, Debug)]
+enum Commands {
     /// 列出所有可用月份
-    #[arg(long)]
-    list_months: bool,
+    ListMonths,
+
+    /// Windows 服务管理（需要管理员权限）
+    #[command(name = "service")]
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceAction {
+    /// 注册为 Windows 服务（开机自启，定期检查）
+    Install {
+        /// 检查间隔天数（默认 7）
+        #[arg(long, default_value = "7")]
+        interval: u64,
+        /// 手动指定 nssm.exe 路径
+        #[arg(long)]
+        nssm_path: Option<PathBuf>,
+    },
+    /// 移除 Windows 服务
+    Remove {
+        /// 手动指定 nssm.exe 路径
+        #[arg(long)]
+        nssm_path: Option<PathBuf>,
+    },
+    /// 服务入口（由 NSSM 调用，不直接使用）
+    Run {
+        /// 检查间隔天数
+        #[arg(long, default_value = "7")]
+        interval: u64,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if cli.list_months {
-        println!("[*] 获取可用月份列表...");
-        let months = github::list_months().await?;
-        println!("可用月份（共 {} 个）:", months.len());
-        for m in &months {
-            println!("  {}", m);
+    match &cli.command {
+        Some(Commands::ListMonths) => {
+            let months = github::list_months().await?;
+            println!("可用月份（共 {} 个）:", months.len());
+            for m in &months {
+                println!("  {m}");
+            }
         }
-        return Ok(());
+        Some(Commands::Service { action }) => match action {
+            ServiceAction::Install {
+                interval,
+                nssm_path,
+            } => {
+                let exe = std::env::current_exe()?;
+                service::install(&exe, nssm_path.as_deref(), *interval)?;
+            }
+            ServiceAction::Remove { nssm_path } => {
+                service::remove(nssm_path.as_deref())?;
+            }
+            ServiceAction::Run { interval } => {
+                let days = *interval;
+                service::run_loop(days, || run_license_check(&cli, true)).await;
+            }
+        },
+        None => {
+            // 默认行为: 手动运行一次
+            run_license_check(&cli, false).await?;
+        }
     }
 
-    // Step 1: 获取月份
+    Ok(())
+}
+
+/// 核心逻辑: 扫描产品 → 匹配 license → 下载 → 安装
+///
+/// `quiet` 模式下输出适合服务日志的简洁格式
+pub(crate) async fn run_license_check(cli: &Cli, quiet: bool) -> Result<()> {
+    // 1. 获取月份
     let months = github::list_months().await?;
     if months.is_empty() {
         anyhow::bail!("仓库中没有可用的月份数据");
@@ -55,40 +120,46 @@ async fn main() -> Result<()> {
 
     let target_month = if let Some(ref m) = cli.month {
         if !months.contains(m) {
-            anyhow::bail!("月份 {m} 不在可用列表中，使用 --list-months 查看");
+            anyhow::bail!("月份 {m} 不在可用列表中");
         }
         m.clone()
     } else {
-        let latest = months[0].clone();
-        println!("[*] 使用最新月份: {latest}");
-        latest
+        months[0].clone()
     };
 
-    // Step 2: 获取所有 license 文件
-    println!("[*] 获取 {target_month} 的许可证文件列表...");
-    let entries = github::list_files(&target_month).await?;
-    let dat_count = entries.iter().filter(|e| e.name.ends_with(".dat")).count();
-    println!("    找到 {dat_count} 个 .dat 文件\n");
+    if !quiet {
+        println!("[*] 使用最新月份: {target_month}");
+    }
 
-    // Step 3: 检测产品
+    // 2. 获取 license 文件列表
+    if !quiet {
+        println!("[*] 获取 {target_month} 的许可证文件列表...");
+    }
+    let entries = github::list_files(&target_month).await?;
+
+    if !quiet {
+        let dat_count = entries.iter().filter(|e| e.name.ends_with(".dat")).count();
+        println!("    找到 {dat_count} 个 .dat 文件\n");
+    }
+
+    // 3. 检测产品
     let products: Vec<detect::MvtecProduct> = if let Some(ref root) = cli.halcon_root {
-        println!("[*] 使用指定路径: {}", root.display());
         let version = detect::extract_version_from_path(root)
             .ok_or_else(|| anyhow::anyhow!("无法从路径 {} 提取版本号", root.display()))?;
         let kind = detect::ProductKind::from_dir_name(
             &root.file_name().unwrap_or_default().to_string_lossy(),
         );
-        let product = detect::MvtecProduct {
+        vec![detect::MvtecProduct {
             root: root.clone(),
             version,
             kind,
-        };
-        println!("    类型: {}\n", product.kind.label());
-        vec![product]
+        }]
     } else {
-        println!("[*] 正在扫描 MVTec 产品...");
-        let products = detect::find_all_products()?;
-        println!("    发现 {} 个产品:", products.len());
+        detect::find_all_products()?
+    };
+
+    if !quiet {
+        println!("[*] 发现 {} 个产品:", products.len());
         for p in &products {
             println!(
                 "      {} {} ({})",
@@ -98,52 +169,54 @@ async fn main() -> Result<()> {
             );
         }
         println!();
-        products
-    };
+    }
 
-    // Step 4: 为每个产品收集、下载、合并安装 license
+    // 4. 处理每个产品
     let mut success = 0;
-    let mut download_cache: std::collections::HashMap<String, Vec<u8>> =
-        std::collections::HashMap::new();
+    let mut download_cache: HashMap<String, Vec<u8>> = HashMap::new();
 
     for product in &products {
-        println!(
-            "--- {} {} ---",
-            product.version,
-            product.kind.label()
-        );
-        println!("  路径: {}", product.root.display());
+        if !quiet {
+            println!(
+                "--- {} {} ---",
+                product.version,
+                product.kind.label()
+            );
+            println!("  路径: {}", product.root.display());
+        }
 
         let matched = license::pick_licenses_for_product(&entries, product);
-
         if matched.is_empty() {
-            println!("  [!] 未找到任何匹配的许可证，跳过\n");
+            if !quiet {
+                println!("  [!] 未找到匹配的许可证，跳过\n");
+            }
             continue;
         }
 
-        // 显示匹配的文件
-        let descs = license::describe_bundle(&matched);
-        println!("  [*] 将合并 {} 个许可证:", matched.len());
-        for (entry, desc) in matched.iter().zip(descs.iter()) {
-            println!("      {} ({})", entry.name, desc);
+        if !quiet {
+            let descs = license::describe_bundle(&matched);
+            println!("  [*] 将合并 {} 个许可证:", matched.len());
+            for (entry, desc) in matched.iter().zip(descs.iter()) {
+                println!("      {} ({})", entry.name, desc);
+            }
         }
 
-        // 下载所有匹配文件（使用缓存避免重复下载）
+        // 下载
         let mut datas: Vec<Vec<u8>> = Vec::new();
         let mut all_ok = true;
         for entry in &matched {
             if let Some(cached) = download_cache.get(&entry.name) {
-                println!("      ↓ 已缓存: {} ({} 字节)", entry.name, cached.len());
                 datas.push(cached.clone());
             } else {
                 match github::download_file(&target_month, &entry.name).await {
                     Ok(data) => {
-                        println!("      ↓ 已下载: {} ({} 字节)", entry.name, data.len());
                         download_cache.insert(entry.name.clone(), data.clone());
                         datas.push(data);
                     }
                     Err(e) => {
-                        eprintln!("      ✗ 下载失败: {} — {e}", entry.name);
+                        if !quiet {
+                            eprintln!("      ✗ 下载失败: {} — {e}", entry.name);
+                        }
                         all_ok = false;
                     }
                 }
@@ -151,30 +224,32 @@ async fn main() -> Result<()> {
         }
 
         if !all_ok || datas.is_empty() {
-            println!("  [!] 下载未完全成功，跳过安装\n");
+            if !quiet {
+                println!("  [!] 下载未完全成功，跳过安装\n");
+            }
             continue;
         }
 
-        // 合并安装
+        // 安装
         match install::install_license_bundle(&datas, &product.root, cli.dry_run, cli.force) {
             Ok(()) => {
                 success += 1;
-                println!("  [✓] 完成\n");
             }
             Err(e) => {
-                eprintln!("  [!] 安装失败: {e}\n");
+                if !quiet {
+                    eprintln!("  [!] 安装失败: {e}\n");
+                }
             }
         }
     }
 
-    // Step 5: 总结
-    let total = products.len();
-    if cli.dry_run {
-        println!("[DRY-RUN] 以上是将要执行的操作（{total} 个产品），实际文件未被修改");
-    } else {
-        println!(
-            "[✓] 完成! {success}/{total} 个产品已安装许可证",
-        );
+    if !quiet {
+        let total = products.len();
+        if cli.dry_run {
+            println!("[DRY-RUN] 以上是将要执行的操作（{total} 个产品），实际文件未被修改");
+        } else {
+            println!("[✓] 完成! {success}/{total} 个产品已安装许可证");
+        }
     }
 
     Ok(())
