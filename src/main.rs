@@ -48,11 +48,11 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum ServiceAction {
-    /// 注册为 Windows 服务（开机自启，定期检查）
+    /// 注册为 Windows 服务（开机自启，每月固定日期执行）
     Install {
-        /// 检查间隔天数（默认 7）
-        #[arg(long, default_value = "7")]
-        interval: u64,
+        /// 每月几号执行（1-28，逗号分隔，默认 1）
+        #[arg(long, default_value = "1")]
+        days: String,
         /// 手动指定 nssm.exe 路径
         #[arg(long)]
         nssm_path: Option<PathBuf>,
@@ -65,9 +65,9 @@ enum ServiceAction {
     },
     /// 服务入口（由 NSSM 调用，不直接使用）
     Run {
-        /// 检查间隔天数
-        #[arg(long, default_value = "7")]
-        interval: u64,
+        /// 每月几号执行（1-28，逗号分隔）
+        #[arg(long, default_value = "1")]
+        days: String,
     },
 }
 
@@ -84,19 +84,17 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Service { action }) => match action {
-            ServiceAction::Install {
-                interval,
-                nssm_path,
-            } => {
+            ServiceAction::Install { days, nssm_path } => {
                 let exe = std::env::current_exe()?;
-                service::install(&exe, nssm_path.as_deref(), *interval)?;
+                let d = service::parse_days(days)?;
+                service::install(&exe, nssm_path.as_deref(), &d)?;
             }
             ServiceAction::Remove { nssm_path } => {
                 service::remove(nssm_path.as_deref())?;
             }
-            ServiceAction::Run { interval } => {
-                let days = *interval;
-                service::run_loop(days, || run_license_check(&cli, true)).await;
+            ServiceAction::Run { days } => {
+                let d = service::parse_days(days)?;
+                service::run_loop(d, || run_license_check(&cli, true)).await;
             }
         },
         None => {
@@ -183,6 +181,18 @@ pub(crate) async fn run_license_check(cli: &Cli, quiet: bool) -> Result<()> {
                 product.kind.label()
             );
             println!("  路径: {}", product.root.display());
+        }
+
+        // 检查当前 license 是否仍然有效
+        if install::is_license_valid(&product.root) {
+            if !quiet {
+                println!("  [✓] 当前 license 有效，跳过");
+            }
+            success += 1;
+            if !quiet {
+                println!();
+            }
+            continue;
         }
 
         let matched = license::pick_licenses_for_product(&entries, product);

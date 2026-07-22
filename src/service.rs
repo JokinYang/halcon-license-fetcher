@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::Datelike;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -8,16 +9,14 @@ const NSSM_BYTES: &[u8] = include_bytes!("../assets/nssm.exe");
 // ── service install ──────────────────────────────────────────
 
 /// 注册 Windows 服务
-pub fn install(exe_path: &Path, nssm_path: Option<&Path>, interval_days: u64) -> Result<()> {
+pub fn install(exe_path: &Path, nssm_path: Option<&Path>, days: &[u32]) -> Result<()> {
     let nssm = ensure_nssm(nssm_path)?;
     println!("[*] NSSM: {}", nssm.display());
 
-    // 检查管理员权限
     if !is_admin() {
         anyhow::bail!("安装服务需要管理员权限，请以管理员身份运行");
     }
 
-    // 如果服务已存在，先询问
     if service_exists() {
         anyhow::bail!(
             "服务 {SERVICE_NAME} 已存在。请先运行 'service remove' 移除旧服务，或使用 sc 命令手动管理"
@@ -27,28 +26,29 @@ pub fn install(exe_path: &Path, nssm_path: Option<&Path>, interval_days: u64) ->
     let exe_str = exe_path.to_string_lossy();
     let exe_dir = exe_path.parent().unwrap_or(Path::new("."));
 
+    let days_str = days.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
+    let desc = days_desc(days);
+
     // 安装服务
     nssm_run(&nssm, &["install", SERVICE_NAME, &exe_str])?;
-    nssm_set(&nssm, "AppParameters", &format!("service run --interval {interval_days}"))?;
+    nssm_set(&nssm, "AppParameters", &format!("service run --days {days_str}"))?;
     nssm_set(&nssm, "DisplayName", "Halcon License Fetcher")?;
-    nssm_set(&nssm, "Description", "自动更新 MVTec 产品许可证 - 每 7 天检查一次")?;
+    nssm_set(&nssm, "Description", &format!("自动更新 MVTec 产品许可证 - {desc}"))?;
     nssm_set(&nssm, "Start", "SERVICE_AUTO_START")?;
 
-    // 日志输出到 exe 同目录
     let stdout_log = exe_dir.join("service_stdout.log");
     let stderr_log = exe_dir.join("service_stderr.log");
     nssm_set(&nssm, "AppStdout", &stdout_log.to_string_lossy())?;
     nssm_set(&nssm, "AppStderr", &stderr_log.to_string_lossy())?;
 
-    // 启动服务
     nssm_run(&nssm, &["start", SERVICE_NAME])?;
 
     println!("[✓] 服务已安装并启动");
     println!("    服务名: {SERVICE_NAME}");
     println!("    启动类型: 自动");
-    println!("    检查间隔: 每 {interval_days} 天");
+    println!("    执行计划: {desc}");
     println!("    日志: {}", stdout_log.display());
-    println!("");
+    println!();
     println!("    可以使用以下命令管理:");
     println!("      sc stop {SERVICE_NAME}");
     println!("      sc start {SERVICE_NAME}");
@@ -70,27 +70,22 @@ pub fn remove(nssm_path: Option<&Path>) -> Result<()> {
         return Ok(());
     }
 
-    // 停止服务
     println!("[*] 正在停止服务...");
     let _ = nssm_run(&nssm, &["stop", SERVICE_NAME]);
 
-    // 移除服务
     println!("[*] 正在移除服务...");
     nssm_run(&nssm, &["remove", SERVICE_NAME, "confirm"])?;
 
     println!("[✓] 服务已移除");
-
     Ok(())
 }
 
 /// 服务主循环（由 NSSM 调用）
-pub async fn run_loop<F, Fut>(interval_days: u64, check_fn: F)
+pub async fn run_loop<F, Fut>(days: Vec<u32>, check_fn: F)
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let interval = chrono::Duration::days(interval_days as i64);
-
     loop {
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         eprintln!("[{now}] 开始检查 license...");
@@ -98,22 +93,107 @@ where
         match check_fn().await {
             Ok(()) => {
                 let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                eprintln!("[{now}] 检查完成，下次检查: {} 天后", interval_days);
+                let next = next_run_desc(&days);
+                eprintln!("[{now}] 检查完成，{next}");
             }
             Err(e) => {
                 let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                let next = next_run_desc(&days);
                 eprintln!("[{now}] 检查失败: {e}");
-                eprintln!("[{now}] 将在 {interval_days} 天后重试");
+                eprintln!("[{now}] {next} 重试");
             }
         }
 
-        tokio::time::sleep(interval.to_std().unwrap()).await;
+        let secs = seconds_until_next_run(&days);
+        tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
     }
+}
+
+// ── 调度计算 ────────────────────────────────────────────────
+
+/// 计算距离下次执行还剩多少秒
+fn seconds_until_next_run(days: &[u32]) -> i64 {
+    let now = chrono::Local::now();
+    let today = now.date_naive();
+    let mut sorted: Vec<u32> = days.to_vec();
+    sorted.sort();
+
+    // 查找本月还未过的最近日期
+    for day in &sorted {
+        if *day > today.day() {
+            if let Some(target) = today.with_day(*day) {
+                if let Some(target_dt) = target.and_hms_opt(0, 0, 0) {
+                    let delta = target_dt - now.naive_local();
+                    return delta.num_seconds().max(60);
+                }
+            }
+        }
+    }
+
+    // 本月所有目标日已过，取下月第一个
+    let first = sorted.first().copied().unwrap_or(1);
+    let (next_year, next_month) = if today.month() == 12 {
+        (today.year() + 1, 1)
+    } else {
+        (today.year(), today.month() + 1)
+    };
+
+    if let Some(next) = chrono::NaiveDate::from_ymd_opt(next_year, next_month, first) {
+        if let Some(target_dt) = next.and_hms_opt(0, 0, 0) {
+            let delta = target_dt - now.naive_local();
+            return delta.num_seconds().max(60);
+        }
+    }
+
+    86400 // fallback: 1 天
+}
+
+fn next_run_desc(days: &[u32]) -> String {
+    let now = chrono::Local::now();
+    let today = now.date_naive();
+    let mut sorted: Vec<u32> = days.to_vec();
+    sorted.sort();
+
+    for day in &sorted {
+        if *day > today.day() {
+            if let Some(target) = today.with_day(*day) {
+                return format!("下次执行: {}", target.format("%m月%d日"));
+            }
+        }
+    }
+
+    let first = sorted.first().copied().unwrap_or(1);
+    format!("下次执行: 下月{}日", first)
+}
+
+fn days_desc(days: &[u32]) -> String {
+    let mut sorted: Vec<u32> = days.to_vec();
+    sorted.sort();
+    let list: Vec<String> = sorted.iter().map(|d| format!("{}日", d)).collect();
+    format!("每月 {}", list.join("、"))
+}
+
+/// 解析 --days 参数
+pub fn parse_days(s: &str) -> Result<Vec<u32>> {
+    let mut days = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        let d: u32 = part
+            .parse()
+            .with_context(|| format!("无效日期: {part}"))?;
+        if d < 1 || d > 28 {
+            anyhow::bail!("日期必须在 1-28 之间（避免月末缺失）: {d}");
+        }
+        days.push(d);
+    }
+    if days.is_empty() {
+        anyhow::bail!("至少指定一个日期");
+    }
+    Ok(days)
 }
 
 // ── NSSM 内部辅助 ──────────────────────────────────────────
 
-/// 确保 nssm.exe 可用：优先使用指定路径，否则从嵌入资源提取
 fn ensure_nssm(nssm_path: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = nssm_path {
         if path.exists() {
@@ -122,7 +202,6 @@ fn ensure_nssm(nssm_path: Option<&Path>) -> Result<PathBuf> {
         anyhow::bail!("指定的 NSSM 路径不存在: {}", path.display());
     }
 
-    // 优先同目录已有的 nssm.exe
     let exe_dir = std::env::current_exe()
         .context("获取 exe 路径失败")?
         .parent()
@@ -133,14 +212,12 @@ fn ensure_nssm(nssm_path: Option<&Path>) -> Result<PathBuf> {
         return Ok(local_nssm);
     }
 
-    // 从嵌入资源提取
     println!("[*] 正在提取 NSSM...");
     std::fs::write(&local_nssm, NSSM_BYTES)
         .context(format!("提取 NSSM 失败: {}", local_nssm.display()))?;
     Ok(local_nssm)
 }
 
-/// 执行 nssm 命令（不需要输出）
 fn nssm_run(nssm: &Path, args: &[&str]) -> Result<()> {
     let output = Command::new(nssm)
         .args(args)
@@ -154,7 +231,6 @@ fn nssm_run(nssm: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// 执行 nssm set 命令
 fn nssm_set(nssm: &Path, param: &str, value: &str) -> Result<()> {
     let output = Command::new(nssm)
         .args(["set", SERVICE_NAME, param, value])
@@ -168,19 +244,38 @@ fn nssm_set(nssm: &Path, param: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// 检查服务是否已存在
 fn service_exists() -> bool {
-    let output = Command::new("sc")
+    Command::new("sc")
         .args(["query", SERVICE_NAME])
-        .output();
-    output.map(|o| o.status.success()).unwrap_or(false)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
-/// 检查是否以管理员权限运行
 fn is_admin() -> bool {
-    // 简单检测: 尝试读取一个需要管理员权限的注册表键
     use winreg::enums::*;
     winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(r"SOFTWARE\Microsoft\Windows\CurrentVersion", KEY_READ)
         .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_days() {
+        assert_eq!(parse_days("1").unwrap(), vec![1]);
+        assert_eq!(parse_days("1,15").unwrap(), vec![1, 15]);
+        assert!(parse_days("0").is_err());
+        assert!(parse_days("29").is_err());
+        assert!(parse_days("abc").is_err());
+    }
+
+    #[test]
+    fn test_seconds_until_next() {
+        // 至少应返回正值
+        let s = seconds_until_next_run(&[1, 15]);
+        assert!(s > 0);
+    }
 }
