@@ -2,7 +2,8 @@ name: Build and Release
 
 on:
   push:
-    branches: [main]
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -23,9 +24,9 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          name: Latest Build
-          tag_name: latest
-          prerelease: true
+          name: ${{ github.ref_type == 'tag' && github.ref_name || 'Latest Build' }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
+          prerelease: ${{ github.ref_type != 'tag' }}
           files: target/release/halcon-license-fetcher.exe
           body: |
             自动构建于 ${{ github.sha }}
