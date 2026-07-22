@@ -1,0 +1,31 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Latest Build
+          tag_name: latest
+          prerelease: true
+          files: target/release/halcon-license-fetcher.exe
+          body: |
+            自动构建于 ${{ github.sha }}
+            - 支持的产品: HALCON / HDevelop / DeepLearningTool
+            - NSSM 已嵌入，可直接 `service install`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
